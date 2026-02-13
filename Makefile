@@ -43,8 +43,11 @@ install: check-up-to-date build
 	@rm -f $(INSTALL_DIR)/$(BINARY)
 	@cp $(BUILD_DIR)/$(BINARY) $(INSTALL_DIR)/$(BINARY)
 	@# Nuke any stale go-install binaries that shadow the canonical location
+	@# Skip symlinks to the install dir (these are intentional aliases)
 	@for bad in $(HOME)/go/bin/$(BINARY) $(HOME)/bin/$(BINARY); do \
-		if [ -f "$$bad" ]; then \
+		if [ -L "$$bad" ] && [ "$$(readlink -f "$$bad")" = "$$(readlink -f $(INSTALL_DIR)/$(BINARY))" ]; then \
+			continue; \
+		elif [ -f "$$bad" ]; then \
 			echo "Removing stale $$bad (use make install, not go install)"; \
 			rm -f "$$bad"; \
 		fi; \
