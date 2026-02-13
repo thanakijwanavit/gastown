@@ -174,6 +174,31 @@ func runDone(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cannot determine current rig (working directory may be deleted)")
 	}
 
+	// FIX (gm-pgc2i): When gt is invoked via shell alias (cd ~/gt && gt),
+	// cwd is the town root, not the polecat's worktree. Detect this and
+	// reconstruct the actual polecat clone path for correct git operations.
+	if cwdAvailable && cwd == townRoot {
+		if polecatName := os.Getenv("GT_POLECAT"); polecatName != "" && rigName != "" {
+			// Try new worktree layout: <rig>/polecats/<polecat>/<rig>/
+			polecatClone := filepath.Join(townRoot, rigName, "polecats", polecatName, rigName)
+			if _, err := os.Stat(polecatClone); err == nil {
+				cwd = polecatClone
+			} else {
+				// Try old layout: <rig>/polecats/<polecat>/
+				polecatClone = filepath.Join(townRoot, rigName, "polecats", polecatName)
+				if _, err := os.Stat(filepath.Join(polecatClone, ".git")); err == nil {
+					cwd = polecatClone
+				}
+			}
+		} else if crewName := os.Getenv("GT_CREW"); crewName != "" && rigName != "" {
+			// Crew worker at town root - reconstruct crew clone path
+			crewClone := filepath.Join(townRoot, rigName, "crew", crewName)
+			if _, err := os.Stat(crewClone); err == nil {
+				cwd = crewClone
+			}
+		}
+	}
+
 	// Initialize git - use cwd if available, otherwise use rig's mayor clone
 	var g *git.Git
 	if cwdAvailable {
