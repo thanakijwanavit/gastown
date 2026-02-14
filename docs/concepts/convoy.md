@@ -221,6 +221,86 @@ The `tracks` relation is:
 Use convoys for "what's the status of this batch of work?"
 Use rig status for "what's everyone in this rig working on?"
 
+## Convoy Archival and Cleanup
+
+Over time, completed convoys can clutter the convoy list. Gas Town provides
+automatic archival and cleanup to manage this.
+
+### Manual Archival
+
+Archive individual convoys to compressed JSONL for historical reference:
+
+```bash
+# Archive a specific convoy
+gt convoy archive hq-cv-abc
+
+# Archive all convoys closed more than 14 days ago
+gt convoy archive --older-than 14
+
+# Archive and remove from active list
+gt convoy archive hq-cv-abc --delete
+
+# Custom archive location
+gt convoy archive --output-dir ~/convoy-archives
+```
+
+### Automatic Cleanup
+
+For periodic cleanup (recommended via cron or deacon patrol):
+
+```bash
+# Archive and remove convoys closed >7 days ago
+gt convoy cleanup
+
+# Custom retention period
+gt convoy cleanup --older-than 30
+```
+
+**Cron Example:**
+
+```cron
+# Run convoy cleanup daily at 2 AM
+0 2 * * * cd ~/gt && gt convoy cleanup >/dev/null 2>&1
+```
+
+**Deacon Patrol Example:**
+
+Add to your deacon patrol script:
+
+```bash
+# In ~/gt/deacon/patrol.sh
+gt convoy cleanup --older-than 7
+```
+
+### Archive Format
+
+Archived convoys are stored as compressed JSONL files:
+
+```
+~/.beads/archive/
+├── hq-cv-abc-20260214-150000.jsonl.gz
+├── hq-cv-def-20260214-150005.jsonl.gz
+└── ...
+```
+
+Each archive contains the full convoy bead data including:
+- Convoy metadata (title, status, dates)
+- Tracked issues list
+- Completion information
+- Notification records
+
+To restore or inspect an archived convoy:
+
+```bash
+# Extract and view
+zcat ~/.beads/archive/hq-cv-abc-*.jsonl.gz | jq .
+
+# Restore to active beads (if needed)
+zcat ~/.beads/archive/hq-cv-abc-*.jsonl.gz | \
+  jq -c . | \
+  bd import -
+```
+
 ## See Also
 
 - [Propulsion Principle](propulsion-principle.md) - Worker execution model

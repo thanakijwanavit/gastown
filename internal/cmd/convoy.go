@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/json"
@@ -61,20 +62,24 @@ func looksLikeIssueID(s string) bool {
 
 // Convoy command flags
 var (
-	convoyMolecule     string
-	convoyNotify       string
-	convoyOwner        string
-	convoyStatusJSON   bool
-	convoyListJSON     bool
-	convoyListStatus   string
-	convoyListAll      bool
-	convoyListTree     bool
-	convoyInteractive  bool
-	convoyStrandedJSON bool
-	convoyCloseReason  string
-	convoyCloseNotify  string
-	convoyCloseForce   bool
-	convoyCheckDryRun  bool
+	convoyMolecule      string
+	convoyNotify        string
+	convoyOwner         string
+	convoyStatusJSON    bool
+	convoyListJSON      bool
+	convoyListStatus    string
+	convoyListAll       bool
+	convoyListTree      bool
+	convoyInteractive   bool
+	convoyStrandedJSON  bool
+	convoyCloseReason   string
+	convoyCloseNotify   string
+	convoyCloseForce    bool
+	convoyCheckDryRun   bool
+	convoyArchiveAll    bool
+	convoyArchiveDays   int
+	convoyArchiveDelete bool
+	convoyArchiveOutput string
 )
 
 var convoyCmd = &cobra.Command{
@@ -238,6 +243,48 @@ Examples:
 	RunE: runConvoyClose,
 }
 
+var convoyArchiveCmd = &cobra.Command{
+	Use:   "archive [convoy-id]",
+	Short: "Archive completed convoys",
+	Long: `Archive completed convoys to compressed JSONL files.
+
+Archives convoys that have been closed for a specified period (default 7 days).
+The convoy data is exported to a compressed JSONL file for historical reference
+and can optionally be removed from the active beads database.
+
+Without arguments, archives all eligible convoys based on age filter.
+With a convoy ID, archives only that convoy (ignores age filter).
+
+For automatic periodic cleanup, run 'gt convoy cleanup' via cron or deacon patrol.
+
+Examples:
+  gt convoy archive                        # Archive all convoys closed >7 days ago
+  gt convoy archive --older-than 14        # Archive convoys closed >14 days ago
+  gt convoy archive hq-cv-abc               # Archive specific convoy
+  gt convoy archive --all --delete         # Archive all closed convoys and remove
+  gt convoy archive --output-dir ./archive # Save to custom directory`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runConvoyArchive,
+}
+
+var convoyCleanupCmd = &cobra.Command{
+	Use:   "cleanup",
+	Short: "Archive and remove old completed convoys",
+	Long: `Archive and remove old completed convoys (default: >7 days old).
+
+This command is designed for periodic automated cleanup via cron or deacon patrol.
+It archives convoys to compressed JSONL and then removes them from active beads
+to reduce convoy list clutter.
+
+The retention period can be configured via --older-than flag (default: 7 days).
+
+Examples:
+  gt convoy cleanup                    # Archive and remove convoys >7 days old
+  gt convoy cleanup --older-than 14    # Archive and remove convoys >14 days old
+  gt convoy cleanup --output-dir ./archive`,
+	RunE: runConvoyCleanup,
+}
+
 func init() {
 	// Create flags
 	convoyCreateCmd.Flags().StringVar(&convoyMolecule, "molecule", "", "Associated molecule ID")
@@ -268,6 +315,16 @@ func init() {
 	convoyCloseCmd.Flags().StringVar(&convoyCloseNotify, "notify", "", "Agent to notify on close (e.g., mayor/)")
 	convoyCloseCmd.Flags().BoolVarP(&convoyCloseForce, "force", "f", false, "Close even if tracked issues are still open")
 
+	// Archive flags
+	convoyArchiveCmd.Flags().BoolVar(&convoyArchiveAll, "all", false, "Archive all closed convoys regardless of age")
+	convoyArchiveCmd.Flags().IntVar(&convoyArchiveDays, "older-than", 7, "Archive convoys closed N or more days ago")
+	convoyArchiveCmd.Flags().BoolVar(&convoyArchiveDelete, "delete", false, "Remove from active beads after archiving")
+	convoyArchiveCmd.Flags().StringVar(&convoyArchiveOutput, "output-dir", "", "Output directory for archives (default: <town>/.beads/archive)")
+
+	// Cleanup command flags (shares archive flags)
+	convoyCleanupCmd.Flags().IntVar(&convoyArchiveDays, "older-than", 7, "Archive and remove convoys closed N or more days ago")
+	convoyCleanupCmd.Flags().StringVar(&convoyArchiveOutput, "output-dir", "", "Output directory for archives (default: <town>/.beads/archive)")
+
 	// Add subcommands
 	convoyCmd.AddCommand(convoyCreateCmd)
 	convoyCmd.AddCommand(convoyStatusCmd)
@@ -276,6 +333,8 @@ func init() {
 	convoyCmd.AddCommand(convoyCheckCmd)
 	convoyCmd.AddCommand(convoyStrandedCmd)
 	convoyCmd.AddCommand(convoyCloseCmd)
+	convoyCmd.AddCommand(convoyArchiveCmd)
+	convoyCmd.AddCommand(convoyCleanupCmd)
 
 	rootCmd.AddCommand(convoyCmd)
 }
@@ -766,6 +825,193 @@ func sendCloseNotification(addr, convoyID, title, reason string) {
 	} else {
 		fmt.Printf("  Notified: %s\n", addr)
 	}
+}
+
+func runConvoyCleanup(cmd *cobra.Command, args []string) error {
+	// Cleanup is archive with --delete enabled
+	convoyArchiveDelete = true
+	return runConvoyArchive(cmd, args)
+}
+
+func runConvoyArchive(cmd *cobra.Command, args []string) error {
+	townBeads, err := getTownBeadsDir()
+	if err != nil {
+		return err
+	}
+
+	// Determine output directory
+	outputDir := convoyArchiveOutput
+	if outputDir == "" {
+		outputDir = filepath.Join(filepath.Dir(townBeads), ".beads", "archive")
+	}
+
+	// Ensure archive directory exists
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("creating archive directory: %w", err)
+	}
+
+	// If a specific convoy ID is provided, archive only that convoy
+	if len(args) == 1 {
+		convoyID := args[0]
+		return archiveSingleConvoy(townBeads, convoyID, outputDir)
+	}
+
+	// Archive multiple convoys based on age filter
+	cutoffTime := time.Now().AddDate(0, 0, -convoyArchiveDays)
+	if convoyArchiveAll {
+		cutoffTime = time.Time{} // Archive all closed convoys
+	}
+
+	convoys, err := findConvoysToArchive(townBeads, cutoffTime)
+	if err != nil {
+		return err
+	}
+
+	if len(convoys) == 0 {
+		fmt.Println("No convoys to archive.")
+		return nil
+	}
+
+	fmt.Printf("Archiving %d convoy(s)...\n", len(convoys))
+
+	archived := 0
+	for _, convoy := range convoys {
+		if err := archiveSingleConvoy(townBeads, convoy.ID, outputDir); err != nil {
+			style.PrintWarning("Failed to archive %s: %v", convoy.ID, err)
+			continue
+		}
+		archived++
+	}
+
+	fmt.Printf("%s Archived %d/%d convoy(s) to %s\n",
+		style.Bold.Render("✓"), archived, len(convoys), outputDir)
+
+	return nil
+}
+
+// archiveSingleConvoy archives a single convoy to a compressed JSONL file.
+func archiveSingleConvoy(townBeads, convoyID, outputDir string) error {
+	// Get convoy details
+	showArgs := []string{"show", convoyID, "--json"}
+	showCmd := exec.Command("bd", showArgs...)
+	showCmd.Dir = townBeads
+	var stdout bytes.Buffer
+	showCmd.Stdout = &stdout
+
+	if err := showCmd.Run(); err != nil {
+		return fmt.Errorf("convoy '%s' not found", convoyID)
+	}
+
+	// Parse convoy data
+	var convoys []map[string]interface{}
+	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
+		return fmt.Errorf("parsing convoy data: %w", err)
+	}
+
+	if len(convoys) == 0 {
+		return fmt.Errorf("convoy '%s' not found", convoyID)
+	}
+
+	convoy := convoys[0]
+
+	// Verify it's actually a convoy type
+	if convoyType, ok := convoy["issue_type"].(string); !ok || convoyType != "convoy" {
+		return fmt.Errorf("'%s' is not a convoy (type: %v)", convoyID, convoy["issue_type"])
+	}
+
+	// Create archive filename with timestamp
+	timestamp := time.Now().Format("20060102-150405")
+	filename := fmt.Sprintf("%s-%s.jsonl.gz", convoyID, timestamp)
+	archivePath := filepath.Join(outputDir, filename)
+
+	// Create gzip file
+	f, err := os.Create(archivePath)
+	if err != nil {
+		return fmt.Errorf("creating archive file: %w", err)
+	}
+	defer f.Close()
+
+	gzWriter := gzip.NewWriter(f)
+	defer gzWriter.Close()
+
+	// Write convoy data as JSON line
+	encoder := json.NewEncoder(gzWriter)
+	if err := encoder.Encode(convoy); err != nil {
+		return fmt.Errorf("writing convoy data: %w", err)
+	}
+
+	fmt.Printf("  📦 %s → %s\n", convoyID, filename)
+
+	// If --delete flag is set, remove the convoy from active beads
+	if convoyArchiveDelete {
+		deleteArgs := []string{"delete", convoyID}
+		deleteCmd := exec.Command("bd", deleteArgs...)
+		deleteCmd.Dir = townBeads
+
+		if err := deleteCmd.Run(); err != nil {
+			style.PrintWarning("Failed to delete %s from active beads: %v", convoyID, err)
+		} else {
+			fmt.Printf("  🗑️  Removed %s from active beads\n", convoyID)
+		}
+	}
+
+	return nil
+}
+
+// convoyArchiveInfo holds basic convoy info for archive filtering.
+type convoyArchiveInfo struct {
+	ID      string
+	Title   string
+	Status  string
+	Closed  time.Time
+}
+
+// findConvoysToArchive finds convoys eligible for archival based on age.
+func findConvoysToArchive(townBeads string, cutoffTime time.Time) ([]convoyArchiveInfo, error) {
+	// Get all closed convoys
+	listArgs := []string{"list", "--type=convoy", "--status=closed", "--json"}
+	listCmd := exec.Command("bd", listArgs...)
+	listCmd.Dir = townBeads
+	var stdout bytes.Buffer
+	listCmd.Stdout = &stdout
+
+	if err := listCmd.Run(); err != nil {
+		return nil, fmt.Errorf("listing convoys: %w", err)
+	}
+
+	var rawConvoys []map[string]interface{}
+	if err := json.Unmarshal(stdout.Bytes(), &rawConvoys); err != nil {
+		return nil, fmt.Errorf("parsing convoy list: %w", err)
+	}
+
+	var eligible []convoyArchiveInfo
+	for _, c := range rawConvoys {
+		id, _ := c["id"].(string)
+		title, _ := c["title"].(string)
+		status, _ := c["status"].(string)
+
+		// Parse closed_at or updated_at timestamp
+		var closedTime time.Time
+		if closedAtStr, ok := c["closed_at"].(string); ok && closedAtStr != "" {
+			closedTime, _ = time.Parse(time.RFC3339, closedAtStr)
+		} else if updatedAtStr, ok := c["updated_at"].(string); ok && updatedAtStr != "" {
+			closedTime, _ = time.Parse(time.RFC3339, updatedAtStr)
+		}
+
+		// Check if convoy is old enough to archive
+		if !cutoffTime.IsZero() && (closedTime.IsZero() || closedTime.After(cutoffTime)) {
+			continue
+		}
+
+		eligible = append(eligible, convoyArchiveInfo{
+			ID:      id,
+			Title:   title,
+			Status:  status,
+			Closed:  closedTime,
+		})
+	}
+
+	return eligible, nil
 }
 
 // strandedConvoyInfo holds info about a stranded convoy.
